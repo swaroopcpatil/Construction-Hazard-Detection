@@ -56,26 +56,13 @@ def _is_loopback_host(value: str | None) -> bool:
         return False
 
 
-def _is_trusted_local_peer(value: str | None) -> bool:
-    """Return whether a peer is loopback or a local private network address."""
-    if not value:
-        return False
-    if _is_loopback_host(value):
-        return True
-    try:
-        return ipaddress.ip_address(value).is_private
-    except ValueError:
-        return False
-
-
 def trusted_local_development_deployment_id(request: Request) -> UUID | None:
     """Return the server-configured deployment for an explicit loopback mode.
 
     This is a development-only exception for a client talking directly to a
     local Uvicorn port.  It does not trust a client-provided tenant or origin:
-    the host must be loopback and the peer either loopback or local container
-    bridge network, and the deployment ID is supplied only by the backend
-    environment.
+    both the host and the peer must be loopback addresses, and the deployment
+    ID is supplied only by the backend environment.
     """
     enabled = os.getenv('LOCAL_DEVELOPMENT_AUTH_ENABLED', '').strip().lower()
     if enabled not in {'1', 'true', 'yes', 'on'}:
@@ -83,7 +70,7 @@ def trusted_local_development_deployment_id(request: Request) -> UUID | None:
     client = request.client
     if not (
         client
-        and _is_trusted_local_peer(client.host)
+        and _is_loopback_host(client.host)
         and _is_loopback_host(request.url.hostname)
     ):
         return None
