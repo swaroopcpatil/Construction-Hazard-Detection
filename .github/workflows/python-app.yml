@@ -73,10 +73,10 @@ jobs:
           -n auto \
           tests/
     - name: Upload coverage to Codecov
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && secrets.CODECOV_TOKEN != '' }}
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: coverage.xml
         disable_search: true
-        fail_ci_if_error: true
+        fail_ci_if_error: false
