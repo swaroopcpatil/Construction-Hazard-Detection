@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import unittest
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+from fastapi import FastAPI
+
+from examples.auth.lifespan import global_lifespan
+
+
+class TestGlobalLifespan(unittest.IsolatedAsyncioTestCase):
+    """Test suite for the global_lifespan async context manager, ensuring
+    startup and shutdown logic is executed correctly."""
+
+    @patch('examples.auth.lifespan.engine')
+    @patch('examples.auth.lifespan.RedisClient')
+    @patch('examples.auth.lifespan.drain_site_media_cleanup_jobs')
+    async def test_global_lifespan(
+        self,
+        mock_drain_cleanup: AsyncMock,
+        mock_redis_client_cls: MagicMock,
+        mock_engine_obj: MagicMock,
+    ) -> None:
+        """Test the global_lifespan async context manager.
+
+        Args:
+            mock_redis_client_cls (MagicMock): Patches the RedisClient class.
+            mock_start_scheduler (MagicMock): Patches start_jwt_scheduler to
+                avoid real scheduling.
+        """
+        # (A) Mock the returned scheduler from start_jwt_scheduler.
+
+        # (B) Mock the RedisClient class/methods.
+        mock_redis_client: MagicMock = MagicMock()
+        mock_redis_client.connect = AsyncMock()
+        mock_redis_client.close = AsyncMock()
+        mock_redis_client_cls.return_value = mock_redis_client
+
+        # Mock engine.begin() async context manager and run_sync
+        mock_conn_ctx = AsyncMock()
+        mock_conn = MagicMock()
+        mock_conn.run_sync = AsyncMock()
+        mock_conn_ctx.__aenter__.return_value = mock_conn
+        mock_engine_obj.begin.return_value = mock_conn_ctx
+        mock_engine_obj.dispose = AsyncMock()
+
+        # (D) Instantiate a FastAPI app to pass into global_lifespan.
+        app: FastAPI = FastAPI()
+
+        # Enter the async context manager.
+        async with global_lifespan(app):
+            # "Startup" logic should have completed by now.
+            mock_redis_client.connect.assert_awaited_once()
+
+            # The app.state.redis_client should be our mock_redis_client.
+            self.assertIs(
+                app.state.redis_client,
+                mock_redis_client,
+                "Expected the app's redis_client to "
+                'be set to our mock object.',
+            )
+
+            # The scheduler should not be shut down
+            # while we are in the context.
+
+            mock_conn.run_sync.assert_not_awaited()
+            mock_drain_cleanup.assert_awaited_once()
+        # Once we exit the context => "shutdown" logic runs.
+        mock_redis_client.close.assert_awaited_once()
+        mock_engine_obj.dispose.assert_awaited_once()
+
+    @patch('examples.auth.lifespan.engine')
+    @patch('examples.auth.lifespan.RedisClient')
+    @patch('examples.auth.lifespan.rate_limiter_service')
+    @patch('examples.auth.lifespan.drain_site_media_cleanup_jobs')
+    async def test_global_lifespan_preload_script_exception(
+        self,
+        mock_drain_cleanup: AsyncMock,
+        mock_rate_limiter_service: MagicMock,
+        mock_redis_client_cls: MagicMock,
+        mock_engine_obj: MagicMock,
+    ) -> None:
+        """Ensure we cover the exception branch during preload_script.
+
+        Args:
+            mock_redis_client_cls (MagicMock): Patches the RedisClient class.
+            mock_start_scheduler (MagicMock): Patches start_jwt_scheduler to
+                avoid real scheduling.
+        """
+        mock_rate_limiter_service.preload_script = AsyncMock(
+            side_effect=Exception('boom'),
+        )
+
+        # Scheduler mock
+
+        # Redis client mocks
+        mock_redis_client: MagicMock = MagicMock()
+        mock_redis_client.connect = AsyncMock()
+        mock_redis_client.close = AsyncMock()
+        mock_redis_client_cls.return_value = mock_redis_client
+
+        # Engine begin context
+        mock_conn_ctx = AsyncMock()
+        mock_conn = MagicMock()
+        mock_conn.run_sync = AsyncMock()
+        mock_conn_ctx.__aenter__.return_value = mock_conn
+        mock_engine_obj.begin.return_value = mock_conn_ctx
+        mock_engine_obj.dispose = AsyncMock()
+
+        app = FastAPI()
+
+        async with global_lifespan(app):
+            # Startup proceeds even when preload_script fails
+            mock_conn.run_sync.assert_not_awaited()
+            mock_drain_cleanup.assert_awaited_once()
+
+        # Shutdown still occurs
+        mock_redis_client.close.assert_awaited_once()
+        mock_engine_obj.dispose.assert_awaited_once()
+
+
+if __name__ == '__main__':
+    unittest.main()

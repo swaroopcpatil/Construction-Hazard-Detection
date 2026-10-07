@@ -1,0 +1,254 @@
+name: construction-hazard-local-full
+
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  OIDC_ENABLED: "true"
+  OIDC_ISSUER_URL: http://keycloak:8080/realms/local-demo
+  OIDC_JWKS_URL: http://keycloak:8080/realms/local-demo/protocol/openid-connect/certs
+  OIDC_AUDIENCE: local-worker,account
+  OIDC_ACCOUNT_URL: http://keycloak:8080/realms/local-demo/account
+  YOLO_CONFIG_DIR: /tmp/Ultralytics
+  LOCAL_DEVELOPMENT_AUTH_ENABLED: "true"
+  LOCAL_DEVELOPMENT_DEPLOYMENT_ID: "00000000-0000-0000-0000-000000000002"
+  WORKER_OIDC_CLIENT_ID: ${WORKER_OIDC_CLIENT_ID}
+  WORKER_OIDC_CLIENT_SECRET: ${WORKER_OIDC_CLIENT_SECRET}
+  WORKER_OIDC_TOKEN_ENDPOINT: http://keycloak:8080/realms/local-demo/protocol/openid-connect/token
+  ALLOW_INSECURE_LOCAL_OIDC_HTTP: "true"
+  FCM_API_URL: http://notification-api:8003
+  VIOLATION_RECORD_API_URL: http://violation-api:8002
+  STREAMING_API_URL: http://streaming-api:8800
+
+services:
+  postgres:
+    image: postgres:17.11-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - local-full-postgres:/var/lib/postgresql/data
+      - ./scripts/init.postgres.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./scripts/init.local-full.sql:/docker-entrypoint-initdb.d/20-local-demo.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4.10-alpine3.21
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  media-server:
+    image: bluenviron/mediamtx:1.18.2
+    environment:
+      MTX_RTSPTRANSPORTS: tcp
+      MTX_HLS: "yes"
+      MTX_WEBRTC: "yes"
+      MTX_HLSALWAYSREMUX: "yes"
+      MTX_HLSSEGMENTDURATION: 2s
+      MTX_HLSSEGMENTCOUNT: 14
+    ports:
+      - "127.0.0.1:8554:8554"
+      - "127.0.0.1:8890:8888"
+      - "127.0.0.1:8889:8889"
+
+  # Loops test.mp4 endlessly into MediaMTX so the detector reads a live RTSP
+  # stream instead of a file (avoids EOF / CAP_PROP_READ_TIMEOUT failures).
+  ffmpeg-loop:
+    image: linuxserver/ffmpeg:latest
+    pull_policy: missing
+    restart: unless-stopped
+    depends_on:
+      media-server:
+        condition: service_started
+    volumes:
+      - ./tests/videos:/videos:ro
+      - ./scripts/ffmpeg-loop.sh:/ffmpeg-loop.sh:ro
+    entrypoint: ["/bin/sh", "/ffmpeg-loop.sh"]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - local-full-keycloak:/opt/keycloak/data
+
+  keycloak-init:
+    image: quay.io/keycloak/keycloak:26.0
+    depends_on:
+      keycloak:
+        condition: service_started
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      WORKER_OIDC_CLIENT_ID: ${WORKER_OIDC_CLIENT_ID}
+      WORKER_OIDC_CLIENT_SECRET: ${WORKER_OIDC_CLIENT_SECRET}
+    volumes:
+      - ./scripts/init.keycloak.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+
+  app-image:
+    build:
+      context: .
+      dockerfile: Dockerfile.local-full
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["true"]
+
+  # One-shot: after keycloak-init, query Keycloak for demo-user's actual UUID
+  # and update user_identities in Postgres so JWT auth works correctly.
+  db-patch:
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["python", "/patch/patch_demo_user_identity.py"]
+    environment:
+      KEYCLOAK_SERVER: http://keycloak:8080
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KEYCLOAK_REALM: local-demo
+      DEMO_USERNAME: demo-user
+      DB_APP_USERNAME: user
+      POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - ./scripts/patch_demo_user_identity.py:/patch/patch_demo_user_identity.py:ro
+    depends_on:
+      app-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak-init:
+        condition: service_completed_successfully
+
+  db-api:
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["uvicorn", "examples.db_management.app:app", "--host", "0.0.0.0", "--port", "8005"]
+    environment: *app-environment
+    depends_on:
+      app-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-patch:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8005:8005"
+
+  notification-api:
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["uvicorn", "examples.local_notification_server.app:app", "--host", "0.0.0.0", "--port", "8003"]
+    environment:
+      <<: *app-environment
+      FIREBASE_CRED_PATH: /app/config/firebase-dummy.json
+      FIREBASE_PROJECT_ID: local-demo
+      FCM_TOKEN_ENCRYPTION_KEY: ${FCM_TOKEN_ENCRYPTION_KEY:-VYm1M-28-XbNYrA5V6Jdqw9n7TIPG4hxithO1QuL7Jc=}
+    volumes:
+      - ./config/firebase-dummy.json:/app/config/firebase-dummy.json:ro
+    depends_on:
+      app-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-patch:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8003:8003"
+
+  violation-api:
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["uvicorn", "examples.violation_records.app:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment: *app-environment
+    depends_on:
+      app-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-patch:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8002:8002"
+
+  streaming-api:
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["uvicorn", "examples.streaming_web.app:app", "--host", "0.0.0.0", "--port", "8800"]
+    environment: *app-environment
+    depends_on:
+      app-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      media-server:
+        condition: service_started
+      db-patch:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8800:8800"
+
+  detector:
+    image: construction-hazard-local-full:latest
+    pull_policy: never
+    command: ["python", "main.py", "--poll", "15"]
+    environment:
+      <<: *app-environment
+      YOLO_WORKER_DEVICES: cpu
+      YOLO_WORKER_PRECISION: f32
+      YOLO_WORKER_CAMERAS_PER_ENGINE: "1"
+      YOLO_WORKER_BATCH_SIZE: "1"
+      MEDIA_PUBLISH_RTSP_BASE_URL: rtsp://media-server:8554
+      MEDIA_PUBLISH_ENCODER: libx264
+      MEDIA_PUBLISH_CLEAN_STREAM: "true"
+      MEDIA_PUBLISH_ANNOTATED_STREAM: "true"
+      MEDIA_PUBLISH_CLEAN_SOURCE_RESTREAM: "false"
+      MEDIA_PUBLISH_FPS: "15"
+      MEDIA_PUBLISH_CLEAN_FPS: "15"
+    volumes:
+      - ./models/pt:/app/models/pt:ro
+      - ./tests/videos:/app/tests/videos:ro
+    depends_on:
+      app-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      media-server:
+        condition: service_started
+      db-patch:
+        condition: service_completed_successfully
+
+volumes:
+  local-full-postgres:
+  local-full-keycloak:

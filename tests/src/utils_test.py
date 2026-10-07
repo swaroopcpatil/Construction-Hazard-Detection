@@ -1,0 +1,1081 @@
+from __future__ import annotations
+
+import time
+import unittest
+from datetime import datetime
+from datetime import timedelta
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import jwt
+import numpy as np
+from shapely.geometry import MultiPolygon
+from shapely.geometry import Polygon
+from sklearn.cluster import HDBSCAN
+
+import src.geometry as utils
+from src.auth_tokens import TokenManager
+from src.redis_client import RedisManager
+from src.runtime_utils import is_expired
+from src.runtime_utils import should_notify
+
+
+class MockSharedToken:
+    """A mock shared token object to simulate race conditions for TokenManager
+    tests.
+
+    Attributes:
+        _data (dict[str, str | bool]):
+            Internal dictionary storing token values.
+        _call_count (int):
+            Tracks the number of times 'get' is called for 'refresh_token'.
+    """
+
+    _data: dict[str, str | bool]
+    _call_count: int
+
+    def __init__(self) -> None:
+        """Initialise the mock shared token with default values."""
+        self._data = {
+            'access_token': 'OLD',
+            'refresh_token': 'ORIGINAL',
+            'is_refreshing': False,
+        }
+        self._call_count = 0
+
+    def get(self, key: str, default: str | bool | None = None) -> str | bool:
+        """Retrieve a value from the mock token dictionary, simulating a change
+        in 'refresh_token' after the first call.
+
+        Args:
+            key (str): The key to retrieve.
+            default (str | bool | None, optional): Default value if key is not
+                present.
+
+        Returns:
+            str | bool: The value associated with the key, or the default.
+        """
+        if key == 'refresh_token':
+            self._call_count += 1
+            if self._call_count == 1:
+                # First call returns the original token for testing purposes
+                return 'ORIGINAL'
+            else:
+                # Subsequent calls simulate a changed token to test race
+                # conditions
+                return 'CHANGED'
+        value = self._data.get(key, default)
+        if value is None:
+            # Always return a str (empty string) if no value is found and no
+            # default is provided
+            value = ''
+        assert isinstance(value, (str, bool)), 'Value must be str or bool.'
+        return value
+
+    def __getitem__(self, key: str) -> str | bool:
+        """Enable bracket access to the internal dictionary.
+
+        Args:
+            key (str): The key to retrieve.
+
+        Returns:
+            str | bool: The value associated with the key.
+        """
+        value: str | bool = self._data[key]
+        assert isinstance(value, (str, bool)), 'Value must be str or bool.'
+        return value
+
+    def __setitem__(self, key: str, value: str | bool) -> None:
+        """Set a value in the internal dictionary.
+
+        Args:
+            key (str): The key to set.
+            value (str | bool): The value to assign.
+        """
+        self._data[key] = value
+
+
+class TestTokenManager(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the TokenManager class, covering authentication and token
+    refresh logic."""
+
+    shared_token: dict[str, str | bool]
+    tm: TokenManager
+
+    def setUp(self) -> None:
+        """Set up a fresh TokenManager and shared_token for each test."""
+        # Initialise shared_token dictionary for each test
+        self.shared_token = {
+            'access_token': '',
+            'refresh_token': '',
+            'is_refreshing': False,
+        }
+        # Create a new TokenManager instance
+        self.tm = TokenManager(
+            shared_token=self.shared_token,
+        )
+
+    async def test_authenticate_no_force_noop(self) -> None:
+        """Test authenticate is skipped when force is False and access_token
+        exists."""
+        self.shared_token['access_token'] = 'EXIST'
+        with patch('aiohttp.ClientSession') as mock_sess:
+            await self.tm.authenticate(force=False)
+            mock_sess.assert_not_called()
+
+    async def test_ensure_token_valid_no_token(self) -> None:
+        """Trigger authenticate if access_token is missing."""
+        self.shared_token['access_token'] = ''
+        with patch.object(
+            self.tm,
+            'authenticate',
+            new_callable=AsyncMock,
+        ) as m_auth:
+            await self.tm.ensure_token_valid()
+            m_auth.assert_awaited_once()
+
+    async def test_ensure_token_valid_has_token(self) -> None:
+        """Skip authentication if access_token exists and is not expired."""
+        self.shared_token['access_token'] = 'EXIST'
+        with (
+            patch.object(
+                self.tm,
+                'authenticate',
+                new_callable=AsyncMock,
+            ) as m_auth,
+            patch.object(
+                self.tm,
+                'is_token_expired',
+                return_value=False,
+            ),
+        ):
+            await self.tm.ensure_token_valid()
+            m_auth.assert_not_awaited()
+
+    async def test_handle_401_over_retries(self) -> None:
+        """Raise RuntimeError if retry limit exceeded on 401 handling."""
+        with self.assertRaises(RuntimeError):
+            await self.tm.handle_401(retry_count=5)
+
+    @patch.object(TokenManager, 'refresh_token', new_callable=AsyncMock)
+    async def test_handle_401_refresh_error(self, m_ref: AsyncMock) -> None:
+        """Retry to authenticate if refresh_token fails during 401 handling."""
+        m_ref.side_effect = Exception('some error')
+        with patch.object(
+            self.tm,
+            'authenticate',
+            new_callable=AsyncMock,
+        ) as m_auth:
+            await self.tm.handle_401(retry_count=0)
+            m_auth.assert_awaited_once()
+
+    async def test_ensure_token_valid_over_retries(self) -> None:
+        """Raise RuntimeError if ensure_token_valid exceeds retry limit."""
+        with self.assertRaises(RuntimeError) as ctx:
+            await self.tm.ensure_token_valid(retry_count=10)
+        self.assertIn(
+            'Exceeded max_retries in ensure_token_valid',
+            str(ctx.exception),
+        )
+
+    def test_is_token_valid_true(self) -> None:
+        """Test is_token_valid returns True when token exists."""
+        self.shared_token['access_token'] = 'test_token'
+        self.assertTrue(self.tm.is_token_valid())
+
+    def test_is_token_valid_false(self) -> None:
+        """Test is_token_valid returns False when token is empty."""
+        self.shared_token['access_token'] = ''
+        self.assertFalse(self.tm.is_token_valid())
+
+    def test_is_token_expired_no_token(self) -> None:
+        """Test is_token_expired returns True when no token exists."""
+        self.shared_token['access_token'] = ''
+        self.assertTrue(self.tm.is_token_expired())
+
+    def test_is_token_expired_valid_token(self) -> None:
+        """Test is_token_expired with a valid JWT token that's not expired."""
+        # Create a valid JWT token that expires in 2 hours
+        exp = int(time.time()) + 7200  # 2 hours from now
+        payload = {'exp': exp, 'user': 'test'}
+        token = jwt.encode(payload, 'secret', algorithm='HS256')
+        self.shared_token['access_token'] = token
+        self.assertFalse(self.tm.is_token_expired())
+
+    def test_is_token_expired_expired_token(self) -> None:
+        """Test is_token_expired with a JWT token that's expired."""
+        # Create a JWT token that expired 1 hour ago
+        exp = int(time.time()) - 3600  # 1 hour ago
+        payload = {'exp': exp, 'user': 'test'}
+        token = jwt.encode(payload, 'secret', algorithm='HS256')
+        self.shared_token['access_token'] = token
+        self.assertTrue(self.tm.is_token_expired())
+
+    def test_is_token_expired_soon_to_expire(self) -> None:
+        """Test is_token_expired with a JWT token that expires in 30
+        seconds."""
+        # Create a JWT token that expires in 30 seconds
+        # (less than 60 second threshold)
+        exp = int(time.time()) + 30
+        payload = {'exp': exp, 'user': 'test'}
+        token = jwt.encode(payload, 'secret', algorithm='HS256')
+        self.shared_token['access_token'] = token
+        self.assertTrue(self.tm.is_token_expired())
+
+    def test_is_token_expired_no_exp_field(self) -> None:
+        """Test is_token_expired with a JWT token that has no exp field."""
+        payload = {'user': 'test'}  # No exp field
+        token = jwt.encode(payload, 'secret', algorithm='HS256')
+        self.shared_token['access_token'] = token
+        self.assertFalse(self.tm.is_token_expired())
+
+    async def test_get_valid_token_success(self) -> None:
+        """Test get_valid_token returns token when valid."""
+        # Create a valid JWT token
+        exp = int(time.time()) + 7200  # 2 hours from now
+        payload = {'exp': exp, 'user': 'test'}
+        token = jwt.encode(payload, 'secret', algorithm='HS256')
+        self.shared_token['access_token'] = token
+
+        result = await self.tm.get_valid_token()
+        self.assertEqual(result, token)
+
+    async def test_get_valid_token_no_token_after_refresh(self) -> None:
+        """Test get_valid_token raises error when no token available after
+        refresh."""
+        self.shared_token['access_token'] = ''
+        self.shared_token['refresh_token'] = ''
+
+        with patch.object(self.tm, 'authenticate', new_callable=AsyncMock):
+            with self.assertRaises(RuntimeError) as ctx:
+                await self.tm.get_valid_token()
+            self.assertIn(
+                'Unable to obtain valid access token',
+                str(ctx.exception),
+            )
+
+    @patch('aiohttp.ClientSession')
+    async def test_get_valid_token_retry_authenticate(
+        self,
+        m_session: AsyncMock,
+    ) -> None:
+        """Test get_valid_token falls back to authenticate when refresh
+        fails."""
+        self.shared_token['access_token'] = ''
+        self.shared_token['refresh_token'] = 'bad_refresh'
+
+        # Mock refresh to fail, then auth to succeed
+        auth_response = AsyncMock()
+        auth_response.status = 200
+        auth_response.json.return_value = {
+            'access_token': 'authenticated_token',
+            'refresh_token': 'new_refresh',
+        }
+
+        session_context = m_session.return_value.__aenter__.return_value
+        session_context.post.side_effect = [
+            Exception('Refresh failed'),  # refresh fails
+            auth_response.__aenter__.return_value,  # auth succeeds
+        ]
+
+        with patch.object(
+            self.tm,
+            'authenticate',
+            new_callable=AsyncMock,
+        ) as mock_auth:
+            mock_auth.return_value = None
+            self.shared_token['access_token'] = 'authenticated_token'
+            result = await self.tm.get_valid_token()
+            self.assertEqual(result, 'authenticated_token')
+
+    async def test_ensure_token_valid_exception_retry(self) -> None:
+        with patch.object(
+            self.tm,
+            'authenticate',
+            AsyncMock(
+                side_effect=[RuntimeError('transient provider failure'), None],
+            ),
+        ) as acquire:
+            await self.tm.ensure_token_valid()
+        self.assertEqual(acquire.await_count, 2)
+
+    async def test_ensure_token_valid_exception_max_retries(self) -> None:
+        with patch.object(
+            self.tm,
+            'authenticate',
+            AsyncMock(side_effect=RuntimeError('provider unavailable')),
+        ) as acquire:
+            with self.assertRaisesRegex(RuntimeError, 'provider unavailable'):
+                await self.tm.ensure_token_valid()
+        self.assertEqual(acquire.await_count, self.tm.max_retries + 1)
+
+
+class TestUtils(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the Utils class, covering all utility functions and edge
+    cases.
+
+    This test class provides comprehensive coverage for the Utils static
+    methods, including error handling, boundary conditions, and various data
+    scenarios.
+    """
+
+    def test_normalise_bbox_extra_fields(self) -> None:
+        """Test normalise_bbox with more than 4 fields (should preserve extra
+        fields).
+
+        # Verifies that bounding boxes with additional fields beyond the #
+        standard [left, top, right, bottom] format retain their extra data #
+        correctly.
+        """
+        bbox: list[float] = [1, 2, 3, 4, 5, 6]
+        result: list[float] = utils.normalise_bbox(bbox)
+        self.assertEqual(result, [1, 2, 3, 4, 5, 6])
+
+        bbox = [4, 3, 2, 1, 0.9, 5, 42, 1]
+        result = utils.normalise_bbox(bbox)
+        self.assertEqual(result, [2, 1, 4, 3, 0.9, 5, 42, 1])
+
+    def test_detect_polygon_from_cones_no_cones(self) -> None:
+        """# Test detect_polygon_from_cones with no cones present (should
+        return # empty list).
+
+        Ensures the method handles detection data that contains no safety
+        # cones (class_id != 6) gracefully by returning an empty polygon
+        # list.
+        """
+        datas: list[list[float]] = [
+            [10, 10, 20, 20, 0.9, 1],  # Non-cone object
+            [30, 30, 40, 40, 0.9, 2],  # Non-cone object
+        ]
+        clusterer: MagicMock = MagicMock()
+        result: list[Polygon] = utils.detect_polygon_from_cones(
+            datas,
+            clusterer,
+        )
+        self.assertEqual(result, [])
+
+    def test_calculate_people_in_controlled_area_no_polygons(self) -> None:
+        """# Test calculate_people_in_controlled_area with no polygons (should
+        # return 0).
+
+        Verifies that when no controlled area polygons are defined, the #
+        method correctly returns zero people count regardless of detection #
+        data.
+        """
+        polygons: list[Polygon] = []
+        datas: list[list[float]] = [
+            [1, 1, 3, 3, 0.9, 5],  # Person detection
+            [4, 4, 8, 8, 0.9, 5],  # Person detection
+        ]
+        count: int = utils.calculate_people_in_controlled_area(polygons, datas)
+        self.assertEqual(count, 0)
+
+    def test_is_expired_with_valid_date(self) -> None:
+        """Test is_expired method with valid ISO 8601 date strings.
+
+        # Verifies that the method correctly identifies expired and # non-
+        expired dates when given properly formatted ISO 8601 date # strings.
+        """
+        # Test with a past date (should return True)
+        past_date: str = (datetime.now() - timedelta(days=1)).isoformat()
+        self.assertTrue(is_expired(past_date))
+
+        # Test with a future date (should return False)
+        future_date: str = (datetime.now() + timedelta(days=1)).isoformat()
+        self.assertFalse(is_expired(future_date))
+
+    def test_is_expired_with_invalid_date(self) -> None:
+        """Test is_expired method with invalid ISO 8601 date string.
+
+        # Ensures that malformed date strings are handled gracefully by #
+        returning False rather than raising an exception.
+        """
+        # Test with an invalid ISO 8601 date (should return False)
+        invalid_date: str = '2024-13-01T00:00:00'
+        self.assertFalse(is_expired(invalid_date))
+
+    def test_is_expired_with_none(self) -> None:
+        """Test is_expired method with None input.
+
+        Verifies that None input is handled appropriately by returning False.
+        """
+        # Test with None (should return False)
+        self.assertFalse(is_expired(None))
+
+    def test_should_notify_true(self) -> None:
+        """Test should_notify returning True when cooldown period has passed.
+
+        # Verifies that notifications are allowed when sufficient time has #
+        elapsed since the last notification based on the cooldown period.
+        """
+        timestamp: int = int(datetime.now().timestamp())
+        last_notification_time: int = timestamp - 400  # 400 seconds ago
+        cooldown_period: int = 300  # 300 second cooldown
+
+        self.assertTrue(
+            should_notify(
+                timestamp,
+                last_notification_time,
+                cooldown_period,
+            ),
+        )
+
+    def test_should_notify_false(self) -> None:
+        """Test should_notify returning False when cooldown period has not
+        passed.
+
+        # Ensures that notifications are blocked when insufficient time has #
+        elapsed since the last notification based on the cooldown period.
+        """
+        timestamp: int = int(datetime.now().timestamp())
+        last_notification_time: int = timestamp - 200  # 200 seconds ago
+        cooldown_period: int = 300  # 300 second cooldown
+
+        self.assertFalse(
+            should_notify(
+                timestamp,
+                last_notification_time,
+                cooldown_period,
+            ),
+        )
+
+    def test_calculate_people_in_controlled_area(self) -> None:
+        """Test case for calculating the number of people in the controlled
+        area."""
+        datas: list[list[float]] = [
+            [50, 50, 150, 150, 0.95, 0],  # Hardhat
+            [200, 200, 300, 300, 0.85, 5],  # Person
+            [400, 400, 500, 500, 0.75, 9],  # Vehicle
+        ]
+        normalised_datas = [utils.normalise_bbox(data) for data in datas]
+        clusterer = HDBSCAN(min_samples=3, min_cluster_size=2, copy=True)
+        polygons = utils.detect_polygon_from_cones(normalised_datas, clusterer)
+        people_count = utils.calculate_people_in_controlled_area(
+            polygons,
+            normalised_datas,
+        )
+        self.assertEqual(people_count, 0)
+
+        datas = [
+            [100, 100, 120, 120, 0.9, 6],  # Safety cone
+            [150, 150, 170, 170, 0.85, 6],  # Safety cone
+            [130, 130, 140, 140, 0.95, 5],  # Person inside the area
+            [300, 300, 320, 320, 0.85, 5],  # Person outside the area
+            [200, 200, 220, 220, 0.89, 6],  # Safety cone
+            [250, 250, 270, 270, 0.85, 6],  # Safety cone
+            [450, 450, 470, 470, 0.92, 6],  # Safety cone
+            [500, 500, 520, 520, 0.88, 6],  # Safety cone
+            [550, 550, 570, 570, 0.86, 6],  # Safety cone
+            [600, 600, 620, 620, 0.84, 6],  # Safety cone
+            [650, 650, 670, 670, 0.82, 6],  # Safety cone
+            [700, 700, 720, 720, 0.80, 6],  # Safety cone
+            [750, 750, 770, 770, 0.78, 6],  # Safety cone
+            [800, 800, 820, 820, 0.76, 6],  # Safety cone
+            [850, 850, 870, 870, 0.74, 6],  # Safety cone
+        ]
+
+        normalised_datas = [utils.normalise_bbox(data) for data in datas]
+        polygons = utils.detect_polygon_from_cones(normalised_datas, clusterer)
+        people_count = utils.calculate_people_in_controlled_area(
+            polygons,
+            normalised_datas,
+        )
+        self.assertEqual(people_count, 1)
+
+    def test_no_cones(self) -> None:
+        """Test case for checking behavior when no cones are detected."""
+        data: list[list[float]] = [
+            [50, 50, 150, 150, 0.95, 0],  # Hardhat
+            [200, 200, 300, 300, 0.85, 5],  # Person
+            [400, 400, 500, 500, 0.75, 2],  # No-Safety Vest
+        ]
+        normalised_data = [utils.normalise_bbox(item) for item in data]
+        clusterer = HDBSCAN(min_samples=3, min_cluster_size=2, copy=True)
+        polygons = utils.detect_polygon_from_cones(normalised_data, clusterer)
+        self.assertEqual(len(polygons), 0)
+
+    def test_person_inside_polygon(self) -> None:
+        """Test case for checking behavior when a person is inside a
+        polygon."""
+        polygons = [
+            Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        ]
+        data: list[list[float]] = [
+            [2, 2, 8, 8, 0.95, 5],  # Person inside the polygon
+        ]
+        normalised_data = [utils.normalise_bbox(item) for item in data]
+        people_count = utils.calculate_people_in_controlled_area(
+            polygons,
+            normalised_data,
+        )
+        self.assertEqual(people_count, 1)
+
+    def test_build_utility_pole_union_no_pole(self) -> None:
+        """Test building utility pole union with no pole data.
+
+        Verifies that when no utility pole data is provided, the function
+        returns an empty Polygon object, ensuring proper handling of empty
+        datasets in the utility pole union calculation.
+        """
+        datas: list[list[float]] = []  # No utility pole data
+        cluster = HDBSCAN(min_samples=3, min_cluster_size=2, copy=True)
+        poly = utils.build_utility_pole_union(datas, cluster)
+        self.assertTrue(isinstance(poly, Polygon))
+        self.assertTrue(poly.is_empty)
+
+    def test_build_utility_pole_union_single_pole(self) -> None:
+        """Test building utility pole union with a single pole.
+
+        Verifies that when only one utility pole is provided, the function
+        correctly creates a non-empty Polygon representing the controlled area
+        around the single pole.
+        """
+        datas: list[list[float]] = [[10, 2, 20, 30, 0.9, 9]]
+        cluster = HDBSCAN(min_samples=3, min_cluster_size=2, copy=True)
+        poly = utils.build_utility_pole_union(datas, cluster)
+        self.assertTrue(isinstance(poly, Polygon))
+        self.assertFalse(poly.is_empty)
+
+    def test_build_utility_pole_union_multiple_poles(self) -> None:
+        """Test building utility pole union with multiple poles.
+
+        Verifies that when multiple utility poles are provided, the function
+        correctly clusters them and creates a union polygon with positive area
+        covering all pole positions.
+        """
+        datas: list[list[float]] = [
+            [10, 2, 20, 30, 0.9, 9],
+            [25, 5, 35, 35, 0.9, 9],
+            [40, 1, 50, 30, 0.9, 9],
+        ]
+        # Lower parameters for clustering
+        cluster = HDBSCAN(min_samples=2, min_cluster_size=2, copy=True)
+        poly = utils.build_utility_pole_union(datas, cluster)
+        self.assertTrue(isinstance(poly, Polygon))
+        self.assertGreater(poly.area, 0)
+
+    def test_detect_polygon_from_cones_empty_list(self) -> None:
+        """Test polygon detection with empty cone data list.
+
+        # Verifies that when an empty list is passed to
+        # detect_polygon_from_cones, the function returns an empty list,
+        # properly covering the early return branch for empty input data.
+
+        Returns:
+            None
+        """
+        clusterer = HDBSCAN(min_samples=3, min_cluster_size=2, copy=True)
+        result = utils.detect_polygon_from_cones([], clusterer)
+        self.assertEqual(
+            result,
+            [],
+            'Expected an empty list when datas is empty.',
+        )
+
+    def test_detect_polygon_from_cones_with_noise(self) -> None:
+        """Test polygon detection when all cones are classified as noise.
+
+        # Verifies that when all safety cones are classified as noise
+        # (label -1) by the clustering algorithm, the function returns an
+        # empty list, properly handling the case where no valid clusters are
+        # formed.
+
+        Returns:
+            None
+        """
+        # Arrange: Prepare test data
+        datas: list[list[float]] = [
+            [10, 10, 20, 20, 0.9, 6],
+            [30, 30, 40, 40, 0.9, 6],
+            [50, 50, 60, 60, 0.9, 6],
+        ]
+        # Use MagicMock to mock clustering behaviour
+        dummy_clusterer = MagicMock()
+        dummy_clusterer.fit_predict.return_value = [
+            -1 for _ in range(len(datas))
+        ]
+        # Call function where all safety cones are marked as noise
+        # (label = -1)
+        polygons = utils.detect_polygon_from_cones(datas, dummy_clusterer)
+        # Expected empty list as all points are skipped
+        self.assertEqual(
+            polygons,
+            [],
+            'Expected no polygons when all points are noise.',
+        )
+
+    def test_calculate_people_in_controlled_area_no_datas(self) -> None:
+        """Test people count calculation with empty detection data.
+
+        # Verifies that calculate_people_in_controlled_area returns 0 when no
+        # detections are provided (empty datas list), ensuring proper
+        # handling of scenarios with no detection data.
+
+        Returns:
+            None
+        """
+        polygons: list[Polygon] = [
+            Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        ]
+        datas: list[list[float]] = []  # Empty list
+
+        people_count = utils.calculate_people_in_controlled_area(
+            polygons,
+            datas,
+        )
+        self.assertEqual(
+            people_count,
+            0,
+            'Expected 0 when datas is empty.',
+        )
+
+    def test_build_utility_pole_union_less_than_min_samples(self) -> None:
+        """Test utility pole union when pole count is below minimum samples.
+
+        # Verifies that when the number of utility poles is less than the
+        # clusterer's minimum samples requirement, the function directly
+        # unions all poles without calling the clustering algorithm.
+
+        Returns:
+            None
+        """
+        # Arrange: Only provide two poles, whilst clusterer.min_samples=3
+        # => len(utility_poles) (2) < clusterer.min_samples(3)
+        datas: list[list[float]] = [
+            # x1, y1, x2, y2, score, class_id=9(utility pole)
+            [10, 5, 20, 30, 0.9, 9],
+            [25, 8, 35, 35, 0.9, 9],
+        ]
+        cluster = HDBSCAN(min_samples=3, min_cluster_size=2, copy=True)
+
+        # Act
+        poly = utils.build_utility_pole_union(datas, cluster)
+
+        # Assert
+        self.assertTrue(isinstance(poly, Polygon))
+        self.assertFalse(
+            poly.is_empty,
+            'Expected a non-empty union polygon with two poles.',
+        )
+        self.assertGreater(
+            poly.area,
+            0,
+            'Union polygon should have a positive area.',
+        )
+
+    def test_build_utility_pole_union_multiple_poles_mst(self) -> None:
+        """Test utility pole union with multiple poles triggering MST
+        calculation.
+
+        Verifies the branch where multiple poles are in the same cluster,
+        which triggers the Minimum Spanning Tree (MST) algorithm and
+        external tangent calculations for polygon creation.
+
+        Returns:
+            None
+        """
+        # Prepare 3 utility pole detections (class_id=9), ensuring >1 pole
+        # with radius>0
+        datas: list[list[float]] = [
+            [10, 2, 20, 30, 0.9, 9],  # pole1
+            [25, 1, 35, 30, 0.9, 9],  # pole2
+            [50, 3, 60, 32, 0.9, 9],  # pole3
+        ]
+
+        # Use MagicMock to mock clusterer with min_samples and fit_predict
+        clusterer = MagicMock()
+        clusterer.min_samples = 2  # Let len(utility_poles)=3 >= min_samples=2
+        clusterer.fit_predict.return_value = [
+            0,
+        ] * len(datas)  # All in the same cluster
+
+        poly = utils.build_utility_pole_union(datas, clusterer)
+        self.assertIsInstance(poly, Polygon)
+        self.assertFalse(
+            poly.is_empty,
+            'Expected a non-empty polygon from MST + tangents union.',
+        )
+
+    def test_build_mst_pairs_deduplicates_coincident_centres(self) -> None:
+        """Coincident detections use zero-cost links without dense fallback."""
+        poles = [
+            (10.0, 10.0, 1.0),
+            (10.0, 10.0, 2.0),
+            (30.0, 10.0, 1.0),
+            (50.0, 10.0, 1.0),
+        ]
+
+        edges = utils.build_mst_pairs(poles)
+
+        self.assertEqual(len(edges), len(poles) - 1)
+        self.assertIn((1, 0), edges)
+        self.assertTrue(
+            any({left, right} == {1, 2} for left, right in edges),
+        )
+
+    def test_get_outer_tangents_distance_less_than_radius_diff(self) -> None:
+        """Test outer tangent calculation with insufficient circle separation.
+
+        Verifies that when the distance between circle centres is less than
+        the absolute difference of their radii, get_outer_tangents returns
+        an empty list, indicating no valid tangent lines exist.
+
+        Returns:
+            None
+        """
+        # Assume large circle radius r1=10, small circle r2=1, centre
+        # distance d=1
+        # => d=1 < abs(10 - 1)=9 => triggers if d < abs(r1 - r2): return []
+        cx1, cy1, r1 = 0, 0, 10
+        cx2, cy2, r2 = 0, 1, 1
+
+        lines = utils.get_outer_tangents(cx1, cy1, r1, cx2, cy2, r2)
+        self.assertEqual(
+            lines,
+            [],
+            'Expected empty list when d < abs(r1 - r2).',
+        )
+
+    def test_get_outer_tangents_distance_less_than_rdiff(self) -> None:
+        """Test outer tangent calculation when distance is less than radius
+        difference.
+
+        Verifies that when the distance between circle centres d is less than
+        r1 - r2 (radius difference), get_outer_tangents returns an empty list,
+        properly handling geometric constraints.
+
+        Returns:
+            None
+        """
+        # Set large circle radius r1=10, small circle radius r2=3 => rdiff=7
+        # Set centre distance d=3 (<7), this will return []
+        cx1, cy1, r1 = 0, 0, 10
+        cx2, cy2, r2 = 0, 3, 3  # Centre distance d=3
+
+        lines = utils.get_outer_tangents(cx1, cy1, r1, cx2, cy2, r2)
+        self.assertEqual(lines, [], 'Expected empty list when d < (r1 - r2).')
+
+    def test_get_outer_tangents_second_check(self) -> None:
+        """Test outer tangent calculation with mocked distance recalculation.
+
+        Verifies the branch where after ensuring r1>=r2, the recomputed
+        distance is less than the radius difference, causing get_outer_tangents
+        to return an empty list through mocked sqrt behaviour.
+
+        Returns:
+            None
+        """
+        # Configuration:
+        # Input circles: First circle: centre(0,0), radius 10; Second circle:
+        # centre(20,0), radius 5
+        # First calculation:
+        #   dx = 20, d = math.sqrt(20^2)=20, satisfies 20 >= abs(10 - 5)=5,
+        # Second calculation: We use side_effect to make math.sqrt return 4,
+        #   at this point rdiff = 10 - 5 = 5, 4 < 5, so empty list is returned.
+        with patch('math.sqrt', side_effect=[20, 4]):
+            lines = utils.get_outer_tangents(0, 0, 10, 20, 0, 5)
+        self.assertEqual(
+            lines,
+            [],
+            'Expected empty list when second sqrt result < rdiff.',
+        )
+
+    def test_count_people_in_polygon(self) -> None:
+        """Test counting people within a polygon boundary.
+
+        Verifies that count_people_in_polygon returns the correct number
+        of unique people (based on centre points) within a given polygon,
+        ensuring accurate person counting for safety monitoring.
+
+        Returns:
+            None
+        """
+        # Create a square polygon with bounds from (0,0) to (10,10)
+        poly = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+        # Create detection data with format: [left, top, right, bottom,
+        # confidence, class_id]
+        # where class_id 5 represents a person
+        datas: list[list[float]] = [
+            [1, 1, 3, 3, 0.9, 5],  # Person 1, centre = (2,2), inside polygon
+            [4, 4, 8, 8, 0.9, 5],  # Person 2, centre = (6,6), inside polygon
+            # Person 3, centre = (13,13), outside polygon
+            [12, 12, 14, 14, 0.9, 5],
+            [2, 2, 4, 4, 0.9, 5],  # Person 4, centre = (3,3), inside polygon
+            [0, 0, 5, 5, 0.8, 2],  # Not a person (class_id != 5)
+        ]
+
+        # Calculate number of people inside the polygon
+        count = utils.count_people_in_polygon(poly, datas)
+
+        # Expected three different centre points inside: (2,2), (6,6) and (3,3)
+        self.assertEqual(
+            count,
+            3,
+            'Expected 3 unique people inside the polygon.',
+        )
+
+    def test_polygons_to_coords(self) -> None:
+        """Test polygon coordinates conversion functionality.
+
+        Verifies that polygons_to_coords correctly converts Polygon
+        and MultiPolygon objects into a list of coordinate lists,
+        and properly skips any empty polygons.
+
+        Returns:
+            None
+        """
+        # Create a normal Polygon
+        poly1 = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+        # Create an empty Polygon (will be ignored)
+        empty_poly = Polygon()
+        # Create two additional Polygons and combine into MultiPolygon
+        poly2 = Polygon([(2, 2), (3, 2), (3, 3), (2, 3)])
+        poly3 = Polygon([(4, 4), (5, 4), (5, 5), (4, 5)])
+        multipoly = MultiPolygon([poly2, poly3])
+
+        # Call function: includes poly1, empty_poly, multipoly
+        result = utils.polygons_to_coords([poly1, empty_poly, multipoly])
+
+        # Expected results
+        expected_poly1 = [list(pt) for pt in poly1.exterior.coords]
+        expected_poly2 = [list(pt) for pt in poly2.exterior.coords]
+        expected_poly3 = [list(pt) for pt in poly3.exterior.coords]
+
+        # Verify result contains poly1 coordinates
+        self.assertIn(
+            expected_poly1,
+            result,
+            'Expected poly1 coordinates to be in the result.',
+        )
+        # Verify result contains coordinates from multipoly's sub-Polygons
+        self.assertIn(
+            expected_poly2,
+            result,
+            'Expected poly2 coordinates to be in the result.',
+        )
+        self.assertIn(
+            expected_poly3,
+            result,
+            'Expected poly3 coordinates to be in the result.',
+        )
+        # Since empty Polygon is ignored, result should have exactly three
+        # items
+        self.assertEqual(
+            len(result),
+            3,
+            'Expected 3 coordinate lists when skipping empty polygons.',
+        )
+
+    def test_get_outer_tangents_d_less_than_eps(self) -> None:
+        """Test outer tangent calculation with coincident circle centres.
+
+        Verifies that when the distance between circle centres is smaller
+        than the epsilon threshold (i.e., circles have the same centre and
+        equal radii), get_outer_tangents returns an empty list.
+
+        Returns:
+            None
+        """
+        # Set both circles with same centre and same radius, so d = 0,
+        # abs(r1 - r2) = 0
+        # First if condition (d < abs(r1 - r2): return []
+        cx1, cy1, r1 = 0, 0, 10
+        cx2, cy2, r2 = 0, 0, 10
+
+        lines = utils.get_outer_tangents(cx1, cy1, r1, cx2, cy2, r2)
+        self.assertEqual(
+            lines,
+            [],
+            'Expected empty list when d < abs(r1 - r2).',
+        )
+
+    def test_is_expired_with_exception(self) -> None:
+        """Test is_expired with date string that causes parsing exception."""
+        # Test with a string that can't be parsed
+        invalid_date = 'not-a-date'
+        result = is_expired(invalid_date)
+        self.assertFalse(result)  # Should return False on parsing error
+
+
+class TestRedisManager(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the RedisManager class, covering basic Redis operations.
+
+    This test class provides comprehensive coverage for Redis operations
+    including error handling, connection management, and data persistence.
+    """
+
+    mock_redis: MagicMock
+    rmgr: RedisManager
+
+    @patch('src.redis_client.redis.Redis')
+    def setUp(self, mock_redis: MagicMock) -> None:
+        """Set up a RedisManager instance with a mocked Redis connection.
+
+        Args:
+            mock_redis (MagicMock): Mocked Redis class for testing.
+        """
+        self.mock_redis = MagicMock()
+        self.mock_redis.get = AsyncMock()
+        self.mock_redis.set = AsyncMock()
+        self.mock_redis.delete = AsyncMock()
+        self.mock_redis.close = AsyncMock()
+        mock_redis.return_value = self.mock_redis
+        self.rmgr = RedisManager()
+
+    async def test_set_success(self) -> None:
+        """Test successful Redis set operation.
+
+        Verifies that the set method correctly calls the underlying Redis set
+        operation with the provided key-value pair.
+        """
+        await self.rmgr.set('key', b'value')
+        self.mock_redis.set.assert_called_once_with('key', b'value')
+
+    async def test_set_error(self) -> None:
+        """Test Redis set operation error handling.
+
+        Ensures that exceptions during set operations are caught and logged
+        appropriately without propagating to the caller.
+        """
+        self.mock_redis.set.side_effect = Exception('Redis error')
+        with self.assertLogs(level='ERROR'):
+            await self.rmgr.set('key', b'value')
+
+    async def test_get_success(self) -> None:
+        """Test successful Redis get operation.
+
+        Verifies that the get method correctly retrieves values from Redis and
+        returns the expected data.
+        """
+        self.mock_redis.get.return_value = b'val'
+        val: bytes | None = await self.rmgr.get('key')
+        self.mock_redis.get.assert_called_once_with('key')
+        self.assertEqual(val, b'val')
+
+    async def test_get_error(self) -> None:
+        """Test Redis get operation error handling.
+
+        Ensures that exceptions during get operations are caught, logged
+        appropriately, and None is returned to the caller.
+        """
+        self.mock_redis.get.side_effect = Exception('Error')
+        with self.assertLogs(level='ERROR'):
+            val: bytes | None = await self.rmgr.get('key2')
+            self.assertIsNone(val)
+
+    async def test_delete_success(self) -> None:
+        """Test successful Redis delete operation.
+
+        Verifies that the delete method correctly calls the underlying Redis
+        delete operation with the specified key.
+        """
+        await self.rmgr.delete('del_key')
+        self.mock_redis.delete.assert_called_once_with('del_key')
+
+    async def test_delete_error(self) -> None:
+        """Test Redis delete operation error handling.
+
+        Ensures that exceptions during delete operations are caught and logged
+        appropriately without propagating to the caller.
+        """
+        self.mock_redis.delete.side_effect = Exception('DelErr')
+        with self.assertLogs(level='ERROR'):
+            await self.rmgr.delete('del_key2')
+
+    async def test_close_connection_success(self) -> None:
+        """Test successful Redis connection closure.
+
+        Verifies that the close_connection method correctly calls the
+        underlying Redis close operation.
+        """
+        await self.rmgr.close_connection()
+        self.mock_redis.close.assert_called_once()
+
+    async def test_close_connection_error(self) -> None:
+        """Test Redis connection closure error handling.
+
+        Ensures that exceptions during connection closure are caught and logged
+        with appropriate error messages for debugging.
+        """
+        self.mock_redis.close.side_effect = Exception('CloseErr')
+        with self.assertLogs(level='ERROR') as log:
+            await self.rmgr.close_connection()
+            self.assertIn(
+                '[ERROR] Failed to close Redis connection: CloseErr',
+                log.output[0],
+            )
+
+
+class TestMinimumSpanningTreeFallbacks(unittest.TestCase):
+    """Exercise all MST candidate and degenerate-input paths."""
+
+    def test_mst_handles_small_and_fully_coincident_inputs(self) -> None:
+        """MST returns direct edges for trivial and coincident pole sets."""
+        self.assertEqual(utils.build_mst_pairs([]), [])
+        self.assertEqual(utils.build_mst_pairs([(1.0, 1.0, 1.0)]), [])
+        self.assertEqual(
+            utils.build_mst_pairs([(1.0, 1.0, 1.0), (2.0, 1.0, 1.0)]),
+            [(0, 1)],
+        )
+        self.assertEqual(
+            utils.build_mst_pairs(
+                [
+                    (1.0, 1.0, 1.0),
+                    (1.0, 1.0, 3.0),
+                    (1.0, 1.0, 2.0),
+                ],
+            ),
+            [(1, 0), (1, 2)],
+        )
+
+    def test_mst_uses_delaunay_edges_and_dense_fallbacks(self) -> None:
+        """MST joins Delaunay candidates and retains both fallbacks.
+
+        The fallback preserves a valid tree for incomplete graph candidates.
+        """
+        poles = [
+            (0.0, 0.0, 1.0),
+            (4.0, 0.0, 1.0),
+            (0.0, 4.0, 1.0),
+        ]
+        triangulation = MagicMock(
+            simplices=np.asarray([[0, 1, 2]], dtype=np.int64),
+        )
+
+        with patch.object(utils, 'Delaunay', return_value=triangulation):
+            candidate_edges = utils.build_mst_pairs(poles)
+        self.assertEqual(len(candidate_edges), 2)
+
+        cycle_poles = [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (10.0, 0.0, 0.0),
+        ]
+        cycle_triangulation = MagicMock(
+            simplices=np.asarray([[0, 1, 2], [0, 1, 3]], dtype=np.int64),
+        )
+        with patch.object(utils, 'Delaunay', return_value=cycle_triangulation):
+            cycle_edges = utils.build_mst_pairs(cycle_poles)
+        self.assertEqual(len(cycle_edges), 3)
+
+        empty_triangulation = MagicMock(
+            simplices=np.empty((0, 3), dtype=np.int64),
+        )
+        with patch.object(utils, 'Delaunay', return_value=empty_triangulation):
+            dense_edges = utils.build_mst_pairs(poles)
+        self.assertEqual(len(dense_edges), 2)
+
+        with patch.object(
+            utils,
+            'Delaunay',
+            side_effect=utils.QhullError('bad'),
+        ):
+            qhull_edges = utils.build_mst_pairs(poles)
+        self.assertEqual(len(qhull_edges), 2)
+
+
+if __name__ == '__main__':
+    unittest.main()

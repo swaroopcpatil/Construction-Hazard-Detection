@@ -1,0 +1,353 @@
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import json
+import logging
+import os
+from typing import cast
+
+import redis.asyncio as redis
+from fastapi import HTTPException
+from fastapi import WebSocket
+from fastapi import WebSocketDisconnect
+
+from examples.auth.config import Settings
+from examples.shared.ws_helpers import authenticate_ws_or_none
+from examples.shared.ws_helpers import check_and_maybe_close_on_timeout
+from examples.shared.ws_helpers import start_session_timer
+from examples.shared.ws_utils import _safe_websocket_receive_bytes
+from examples.shared.ws_utils import _safe_websocket_send_json
+from examples.YOLO_server_api.detection import run_detection_from_bytes
+from examples.YOLO_server_api.model_registry import load_registry
+from examples.YOLO_server_api.model_registry import require_model
+from examples.YOLO_server_api.model_registry import verify_artifact
+from examples.YOLO_server_api.models import DetectionModelManager
+
+# Limit WebSocket concurrency (consistent with original routers.py)
+WS_INFERENCE_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(8)
+
+logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment setting."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _should_bypass_local_auth(client_ip: str) -> bool:
+    """Allow trusted same-host pipeline calls to skip JWT auth."""
+    if not _env_bool('YOLO_WS_ALLOW_LOCALHOST_BYPASS', True):
+        return False
+    try:
+        return ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        return client_ip in {'localhost', 'unknown'}
+
+
+async def _get_model_key_from_ws(
+    websocket: WebSocket,
+    client_ip: str,
+    username: str,
+) -> str | None:
+    """Resolve the model key from headers, query parameters or the first
+    message."""
+    model_key: str | None = websocket.headers.get('x-model-key')
+    if model_key:
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                'Model key from header'
+            ),
+        )
+        return model_key
+
+    logger.info(
+        (
+            f'[YOLO-WebSocket] {client_ip} ({username}): '
+            'Waiting for model key in first message'
+        ),
+    )
+    try:
+        first_message: str = await websocket.receive_text()
+        config_data: dict[str, object] = json.loads(first_message)
+        model_key = cast(str | None, config_data.get('model_key'))
+        if not model_key:
+            logger.info(
+                (
+                    f'[YOLO-WebSocket] {client_ip} ({username}): '
+                    'No model_key found in first message'
+                ),
+            )
+            await websocket.close(
+                code=1008,
+                reason='Missing model_key in configuration',
+            )
+            return None
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                'Model key from first message'
+            ),
+        )
+        return model_key
+    except Exception as e:
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                f'Failed to parse first message: {e}'
+            ),
+        )
+        await websocket.close(
+            code=1008,
+            reason='Invalid configuration message',
+        )
+        return None
+
+
+async def _send_ready_config(
+    websocket: WebSocket,
+    model_key: str,
+    client_ip: str,
+    username: str,
+) -> bool:
+    """Send the ready message after a model has been selected."""
+    config_response: dict[str, str] = {
+        'status': 'ready',
+        'model': model_key,
+        'message': 'Model loaded successfully, ready to process images',
+    }
+    success: bool = await _safe_websocket_send_json(
+        websocket,
+        config_response,
+        f'{client_ip} ({username})',
+    )
+    if not success:
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                'Failed to send configuration response'
+            ),
+        )
+    return success
+
+
+async def _process_frame_and_respond(
+    websocket: WebSocket,
+    img_bytes: bytes,
+    model_instance: object,
+    client_ip: str,
+    username: str,
+) -> bool:
+    """Run detection for one frame and send the result."""
+    datas, _ = await run_detection_from_bytes(
+        img_bytes,
+        model_instance,
+        semaphore=WS_INFERENCE_SEMAPHORE,
+    )
+    success = await _safe_websocket_send_json(
+        websocket,
+        datas,
+        f'{client_ip} ({username})',
+    )
+    if not success:
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                'Failed to send results, stopping'
+            ),
+        )
+    return success
+
+
+async def _load_session_model(websocket, model_key, client_ip, model_loader):
+    subject = websocket.scope.get('_catalog_subject')
+    if isinstance(subject, dict):
+        entry = await asyncio.to_thread(
+            require_model,
+            model_key,
+            websocket.headers.get('x-model-version'),
+            str(subject.get('tenant_id', '')),
+            subject.get('role', ''),
+            'image',
+        )
+    elif _should_bypass_local_auth(client_ip):
+        registry = await asyncio.to_thread(load_registry)
+        entry = next(
+            (
+                m
+                for m in registry.models
+                if m.id == model_key
+                and m.enabled
+                and 'image' in m.capabilities
+            ),
+            None,
+        )
+        if entry is None:
+            raise HTTPException(409, detail='Model unavailable')
+        await asyncio.to_thread(verify_artifact, entry)
+    else:
+        raise HTTPException(403, detail='Missing verified model scope')
+    return await asyncio.to_thread(model_loader.get_registry_model, entry)
+
+
+async def _prepare_model_and_notify(
+    websocket: WebSocket,
+    client_ip: str,
+    username: str,
+    model_loader: DetectionModelManager,
+) -> object | None:
+    """Load the requested model and notify the websocket client."""
+    model_key: str | None = await _get_model_key_from_ws(
+        websocket,
+        client_ip,
+        username,
+    )
+    if not model_key:
+        return None
+    try:
+        model_instance = await _load_session_model(
+            websocket, model_key, client_ip, model_loader,
+        )
+    except HTTPException as exc:
+        await websocket.close(
+            code=1011 if exc.status_code >= 500 else 1008,
+            reason='Model unavailable or access denied',
+        )
+        return None
+    if model_instance is None:
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                f'Model {model_key} not found'
+            ),
+        )
+        await websocket.close(code=1003, reason='Model not found')
+        return None
+    logger.info(
+        (
+            f'[YOLO-WebSocket] {client_ip} ({username}): '
+            f'Using model {model_key}'
+        ),
+    )
+    if not await _send_ready_config(websocket, model_key, client_ip, username):
+        return None
+    return model_instance
+
+
+async def _detect_loop(
+    websocket: WebSocket,
+    session_start: float,
+    model_instance: object,
+    client_ip: str,
+    username: str,
+) -> int:
+    """Receive websocket frames until timeout, close, or send failure."""
+    frame_count: int = 0
+    while True:
+        if await check_and_maybe_close_on_timeout(
+            websocket,
+            session_start,
+            f'[YOLO-WebSocket] {client_ip} ({username})',
+        ):
+            break
+        img_bytes: bytes | None = await _safe_websocket_receive_bytes(
+            websocket,
+            f'{client_ip} ({username})',
+        )
+        if img_bytes is None:
+            logger.info(
+                (
+                    f'[YOLO-WebSocket] {client_ip} ({username}): '
+                    'Failed to receive image data, connection may be closed'
+                ),
+            )
+            break
+        frame_count += 1
+        success = await _process_frame_and_respond(
+            websocket,
+            img_bytes,
+            model_instance,
+            client_ip,
+            username,
+        )
+        if not success:
+            break
+    return frame_count
+
+
+async def handle_websocket_detect(
+    websocket: WebSocket,
+    rds: redis.Redis,
+    settings: Settings,
+    model_loader: DetectionModelManager,
+) -> None:
+    """Handle one YOLO websocket detection session."""
+    client_ip: str = websocket.client.host if websocket.client else 'unknown'
+    logger.info(f'[YOLO-WebSocket] New connection from {client_ip}')
+
+    await websocket.accept()
+
+    if _should_bypass_local_auth(client_ip):
+        username = os.getenv('YOLO_WS_LOCAL_USERNAME') or 'local-main'
+        logger.info(
+            (f'[YOLO-WebSocket] {client_ip}: Localhost auth bypass enabled'),
+        )
+    else:
+        authenticated_username, payload = await authenticate_ws_or_none(
+            websocket,
+            rds,
+            client_tag=f'[YOLO-WebSocket] {client_ip}',
+        )
+        if not authenticated_username:
+            return
+        username = authenticated_username
+        websocket.scope['_catalog_subject'] = (payload or {}).get('subject')
+        logger.info(
+            f'[YOLO-WebSocket] {client_ip}: Authenticated as {username}',
+        )
+
+    session_start: float = start_session_timer()
+
+    model_instance = await _prepare_model_and_notify(
+        websocket,
+        client_ip,
+        username,
+        model_loader,
+    )
+    if model_instance is None:
+        return
+
+    try:
+        await _detect_loop(
+            websocket,
+            session_start,
+            model_instance,
+            client_ip,
+            username,
+        )
+    except WebSocketDisconnect:
+        logger.info(
+            f'[YOLO-WebSocket] {client_ip} ({username}): Client disconnected',
+        )
+    except Exception as e:
+        logger.info(
+            (
+                f'[YOLO-WebSocket] {client_ip} ({username}): '
+                f'Unexpected error: {e}'
+            ),
+        )
+        try:
+            await websocket.close(
+                code=1011,
+                reason='Internal server error',
+            )
+        except Exception:
+            pass
+    finally:
+        logger.info(
+            f'[YOLO-WebSocket] {client_ip} ({username}): Connection closed',
+        )

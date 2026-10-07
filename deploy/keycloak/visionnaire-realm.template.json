@@ -1,0 +1,108 @@
+{
+  "realm": "visionnaire",
+  "enabled": true,
+  "displayName": "Visionnaire",
+  "loginTheme": "visionnaire",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 36000,
+  "clientSessionIdleTimeout": 28800,
+  "clientSessionMaxLifespan": 36000,
+  "accessTokenLifespan": 300,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 5,
+  "browserSecurityHeaders": {
+    "contentSecurityPolicy": "frame-src 'self' https://hcaptcha.com https://*.hcaptcha.com; frame-ancestors 'self'; object-src 'none';"
+  },
+  "passwordPolicy": "length(8) and notUsername(undefined) and passwordHistory(5) and forceExpiredPasswordChange(180)",
+  "clients": [
+    {
+      "clientId": "visionnaire-web",
+      "name": "Visionnaire Web BFF",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "__VISIONNAIRE_WEB_CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://changdar-server.mooo.com/bff/auth/oidc/callback"
+      ],
+      "webOrigins": [
+        "https://changdar-server.mooo.com"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://changdar-server.mooo.com/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "visionnaire-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "visionnaire-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "visionnaire-user-linker",
+      "name": "Visionnaire User Linker",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "__USER_LINKER_CLIENT_SECRET__",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true
+    },
+    {
+      "clientId": "visionnaire-mobile",
+      "name": "Visionnaire Flutter Mobile",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "com.changdar.visionnaire:/oauthredirect"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "com.changdar.visionnaire:/oauthredirect"
+      },
+      "protocolMappers": [
+        {
+          "name": "visionnaire-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "visionnaire-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

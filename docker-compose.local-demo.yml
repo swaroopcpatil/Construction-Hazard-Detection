@@ -1,0 +1,60 @@
+name: construction-hazard-local-demo
+
+services:
+  redis:
+    image: redis:7.4.10-alpine3.21
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.local-demo}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  media-server:
+    image: bluenviron/mediamtx:1.18.2
+    environment:
+      MTX_RTSPTRANSPORTS: tcp
+      MTX_HLS: "yes"
+      MTX_WEBRTC: "yes"
+      MTX_HLSALWAYSREMUX: "yes"
+      MTX_HLSSEGMENTDURATION: 2s
+      MTX_HLSSEGMENTCOUNT: 14
+      MTX_HLSVARIANT: lowLatency
+      MTX_READTIMEOUT: 60s
+    ports:
+      - "127.0.0.1:8554:8554"
+      - "127.0.0.1:8890:8888"
+      - "127.0.0.1:8889:8889"
+    restart: unless-stopped
+
+  annotated-demo-publisher:
+    image: jrottenberg/ffmpeg:6.1-alpine
+    depends_on:
+      media-server:
+        condition: service_started
+    volumes:
+      - ./runs/detect/outputs/quickstart_cpu/test.avi:/media/test.avi:ro
+    command:
+      - -re
+      - -stream_loop
+      - "-1"
+      - -i
+      - /media/test.avi
+      - -an
+      - -c:v
+      - libx264
+      - -preset
+      - veryfast
+      - -tune
+      - zerolatency
+      - -g
+      - "48"
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://media-server:8554/demo/annotated
+    restart: unless-stopped

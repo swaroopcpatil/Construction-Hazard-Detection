@@ -1,0 +1,126 @@
+# OS and editor files
+.DS_Store
+.vscode/
+.history/
+
+# Local lint/pre-commit configuration
+.flake8
+.pre-commit-config.yaml
+.pre-commit-hooks.yaml
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+config/secrets/
+config/model_registry.json
+config/invitation_policy.json
+config/firebase-dummy.json
+*.p8
+examples/local_notification_server/*firebase-adminsdk*.json
+config/configuration copy.*
+config/image_records.json
+config/test_webrtc_config.json
+
+# Python caches and local environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+coverage.xml
+.venv/
+.venv*/
+venv*/
+env/
+
+# Generated runtime output
+*.log
+*.out
+logs/
+**/logs/
+static/
+tmp/
+css-data/
+local_stream_player.html
+ANTIGRAVITY_HANDOFF.md
+
+# Video and media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.ts
+*.m3u8
+tests/videos/*.mp4
+tests/videos/
+
+# Model and training artifacts
+models/
+*.pt
+*.engine
+*.onnx
+*.bin
+*.cache
+runs/
+**/runs/
+examples/YOLO_train/runs/
+examples/YOLO_train/cv_dataset/images/
+examples/YOLO_train/cv_dataset/labels/
+examples/YOLO_train/cv_dataset/val/
+examples/YOLO_train/datasets/
+examples/YOLO_train/sahi_out/
+examples/YOLO_train/test_images/
+examples/YOLO_train/test.py
+examples/YOLO_data_augmentation/dataset_aug/
+examples/YOLO_data_augmentation/visualised_image.jpg
+predictions.json
+/dummy.json
+
+# Local operations and migration tooling. Keep the PostgreSQL bootstrap schema,
+# shared deployment tools, CI scripts and Dockerfiles versioned.
+scripts/apply_postgres_migrations.py
+scripts/cleanup_local_artifacts.py
+scripts/create_deployment_enrollment_code.py
+scripts/init.sql
+scripts/migrations/
+/scripts/**/migrate_*.sql
+/scripts/**/migrate_*.py
+scripts/normalise_python_conventions.py
+scripts/rebuild_single_engine.py
+scripts/rebuild_tensorrt_engines.py
+scripts/send_test_fcm_notification.py
+scripts/tune_local_postgresql18.sh
+scripts/upgrade_system_cudnn.sh
+
+# Personal scripts and database exports. Shared .py/.sql files stay visible.
+/scripts/local/
+/scripts/**/*.local.py
+/scripts/**/*.local.sql
+/scripts/**/local_*.py
+/scripts/**/local_*.sql
+/scripts/backups/
+/scripts/dumps/
+/scripts/**/*.dump
+/scripts/**/*.sql.gz
+/scripts/**/*.sql.bak
+
+# Local implementation reports and operator notes.
+/docs/repository-optimization.md
+/docs/postgresql-query-optimization.md
+/docs/local/
+*.local.md
+
+# Build artifacts
+build/
+frontend/web/
+frontend/web_bak/
+*.egg-info/
+examples/streaming_web/frontend/node_modules/
+examples/streaming_web/frontend/dist/
+
+# Local production deployment configuration; commit an .example variant instead.
+deploy/bff/nginx.changdar-server.complete.conf

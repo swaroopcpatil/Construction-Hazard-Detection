@@ -1,0 +1,41 @@
+name: visionnaire-keycloak
+
+services:
+  keycloak:
+    build:
+      context: ../..
+      dockerfile: deploy/keycloak/Dockerfile
+    restart: unless-stopped
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:?KEYCLOAK_ADMIN_USERNAME must be set}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD must be set}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://127.0.0.1:5432/keycloak
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USERNAME:?KEYCLOAK_DB_USERNAME must be set}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?KEYCLOAK_DB_PASSWORD must be set}
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: https://changdar-server.mooo.com/keycloak
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_HOST: 127.0.0.1
+      KC_HTTP_PORT: "8081"
+      KC_HTTP_RELATIVE_PATH: /keycloak
+      KC_PROXY_HEADERS: xforwarded
+      KC_HCAPTCHA_SITE_KEY: ${HCAPTCHA_SITE_KEY:?HCAPTCHA_SITE_KEY must be set}
+      KC_HCAPTCHA_SECRET_KEY: ${HCAPTCHA_SECRET_KEY:?HCAPTCHA_SECRET_KEY must be set}
+      KEYCLOAK_VISIONNAIRE_WEB_CLIENT_SECRET: ${OIDC_WEB_CLIENT_SECRET:?OIDC_WEB_CLIENT_SECRET must be set}
+      KEYCLOAK_USER_LINKER_CLIENT_SECRET: ${KEYCLOAK_USER_LINKER_CLIENT_SECRET:?KEYCLOAK_USER_LINKER_CLIENT_SECRET must be set}
+      # The custom authenticator may only redeem a native assertion through
+      # this loopback-only endpoint. It shares an independent HMAC secret
+      # with the Visionnaire API and never receives Google/Apple credentials.
+      KC_NATIVE_SOCIAL_EXCHANGE_REDEEM_URL: http://127.0.0.1:8005/auth/native-social/keycloak/redeem
+      KC_NATIVE_SOCIAL_EXCHANGE_SHARED_SECRET: ${NATIVE_SOCIAL_EXCHANGE_SHARED_SECRET:-}
+      # Third-party credentials belong only to Keycloak. The providers stay
+      # hidden unless their corresponding *_ENABLED flag is true and every
+      # required credential is present.
+      KEYCLOAK_GOOGLE_ENABLED: ${KEYCLOAK_GOOGLE_ENABLED:-false}
+      KEYCLOAK_GOOGLE_CLIENT_ID: ${KEYCLOAK_GOOGLE_CLIENT_ID:-}
+      KEYCLOAK_GOOGLE_CLIENT_SECRET: ${KEYCLOAK_GOOGLE_CLIENT_SECRET:-}
+      KEYCLOAK_APPLE_ENABLED: ${KEYCLOAK_APPLE_ENABLED:-false}
+      KEYCLOAK_APPLE_CLIENT_ID: ${KEYCLOAK_APPLE_CLIENT_ID:-}
+      KEYCLOAK_APPLE_CLIENT_SECRET: ${KEYCLOAK_APPLE_CLIENT_SECRET:-}
+    network_mode: host

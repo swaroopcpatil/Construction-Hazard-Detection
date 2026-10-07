@@ -1,0 +1,356 @@
+networks:
+  # Define a custom bridge network for communication between services
+  app_network:
+    driver: bridge
+
+services:
+  base:
+    build:
+      context: .
+      dockerfile: scripts/base.Dockerfile
+    networks:
+      - app_network
+    image: base:latest
+
+  base-gpu:
+    build:
+      context: .
+      dockerfile: scripts/base-gpu.Dockerfile
+    image: base-gpu:latest
+    depends_on:
+      base:
+        condition: service_completed_successfully
+    networks:
+      - app_network
+
+  # Redis service configuration
+  redis:
+    image: redis:7.4.10-alpine3.21
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+    command: redis-server --requirepass "$$REDIS_PASSWORD"
+    # Expose Redis on port 6379
+    ports:
+      - '127.0.0.1:6379:6379'
+    # Configure a health check to ensure Redis is running
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    # Attach Redis to the custom network
+    networks:
+      - app_network
+
+  media-server:
+    image: bluenviron/mediamtx:1.18.2
+    # Keep the playback upstream available after a Docker daemon restart.
+    restart: unless-stopped
+    environment:
+      MTX_RTSPTRANSPORTS: tcp
+      MTX_HLS: 'yes'
+      MTX_WEBRTC: 'yes'
+      # Create HLS only for active viewers. This avoids unnecessary muxers
+      # for every camera and keeps transient segments out of a shared volume.
+      MTX_HLSALWAYSREMUX: ${MTX_HLSALWAYSREMUX:-no}
+      MTX_HLSVARIANT: ${MTX_HLSVARIANT:-lowLatency}
+      MTX_HLSSEGMENTDURATION: ${MTX_HLSSEGMENTDURATION:-2s}
+      MTX_HLSSEGMENTCOUNT: ${MTX_HLSSEGMENTCOUNT:-14}
+      MTX_HLSPARTDURATION: ${MTX_HLSPARTDURATION:-200ms}
+      MTX_HLSMUXERCLOSEAFTER: ${MTX_HLSMUXERCLOSEAFTER:-60s}
+      MTX_READTIMEOUT: 60s
+    ports:
+      - '127.0.0.1:8554:8554'
+      - '127.0.0.1:8890:8888'
+      - '127.0.0.1:8889:8889'
+    networks:
+      - app_network
+
+  # PostgreSQL database service configuration
+  postgres:
+    image: postgres:17.11-bookworm
+    # Set the container name for easier reference
+    container_name: postgres-container
+    # Environment variables for configuring the PostgreSQL database
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB must be set}"
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER must be set}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+    # Expose PostgreSQL on port 5432
+    ports:
+      - '127.0.0.1:5432:5432'
+    # Mount an initialisation SQL script to the PostgreSQL entrypoint directory
+    volumes:
+      - ./scripts/init.postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    # Configure a health check to ensure PostgreSQL is running
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    # Attach PostgreSQL to the custom network
+    networks:
+      - app_network
+
+  # Database management service configuration
+  user-management:
+    # Build the image from the specified Dockerfile
+    build:
+      context: .
+      dockerfile: examples/db_management/Dockerfile
+    # Environment variables for database connection
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres/${POSTGRES_DB:?POSTGRES_DB must be set}"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+      BFF_CHAT_API_URL: http://host.docker.internal:8001
+      BFF_FILES_API_URL: http://host.docker.internal:8004
+      BFF_MANAGEMENT_API_URL: http://127.0.0.1:8005
+      BFF_DETECTION_API_URL: http://yolo-server-api:6000
+      BFF_FCM_API_URL: http://local-notification-server:8003
+      BFF_VIOLATIONS_API_URL: http://violation-records:8002
+      BFF_STREAMING_API_URL: http://streaming-web-backend:8000
+      PLAYBACK_STREAMING_API_URL: http://streaming-web-backend:8000
+    env_file:
+      - .env
+    # Mount the examples directory for application access
+    volumes:
+      - ./examples:/app/examples
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    # Ensure the service starts only after PostgreSQL is healthy
+    depends_on:
+      base:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Expose the user management service on port 8005
+    ports:
+      - '127.0.0.1:8005:8005'
+    # Attach the service to the custom network
+    networks:
+      - app_network
+
+  # YOLO Server API service configuration
+  yolo-server-api:
+    # Build the image from the specified Dockerfile
+    build:
+      context: .
+      dockerfile: examples/YOLO_server_api/Dockerfile
+    # Environment variables for connecting to Redis and PostgreSQL
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres/${POSTGRES_DB:?POSTGRES_DB must be set}"
+    # Ensure the service starts only after Redis and PostgreSQL are healthy
+    depends_on:
+      base:
+        condition: service_started
+      base-gpu:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Mount the examples directory for application access
+    volumes:
+      - ./examples:/app/examples
+      - ./models/pt:/app/models/pt
+    # Expose the YOLO Server API on port 5000
+    ports:
+      - '127.0.0.1:6000:6000'
+    # Attach the service to the custom network
+    networks:
+      - app_network
+  # Streaming web backend service configuration
+  streaming-web-backend:
+    # Build the image from the specified Dockerfile
+    build:
+      context: .
+      dockerfile: examples/streaming_web/Dockerfile
+    # Environment variables for connecting to Redis
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+      MEDIA_PUBLIC_HLS_BASE_URL: ${MEDIA_PUBLIC_HLS_BASE_URL:-/hazard/media}
+      MEDIA_PUBLIC_WEBRTC_BASE_URL: ${MEDIA_PUBLIC_WEBRTC_BASE_URL:-/hazard/media/webrtc}
+      MEDIA_INTERNAL_HLS_BASE_URL: ${MEDIA_INTERNAL_HLS_BASE_URL:-http://media-server:8888}
+      MEDIA_REQUIRE_ANNOTATED_PLAYBACK: ${MEDIA_REQUIRE_ANNOTATED_PLAYBACK:-false}
+      MEDIA_DEFAULT_OVERLAY_LANGUAGE: ${MEDIA_DEFAULT_OVERLAY_LANGUAGE:-zh-TW}
+      MEDIA_OVERLAY_ALLOWED_LANGUAGES: ${MEDIA_OVERLAY_ALLOWED_LANGUAGES:-zh-TW,en,zh-CN,ja,vi,id,fr,th}
+      MEDIA_OVERLAY_MAX_ACTIVE_LANGUAGES_PER_STREAM: ${MEDIA_OVERLAY_MAX_ACTIVE_LANGUAGES_PER_STREAM:-5}
+      MEDIA_OVERLAY_DEMAND_TTL_SECONDS: ${MEDIA_OVERLAY_DEMAND_TTL_SECONDS:-90}
+      MEDIA_PUBLISHER_IDLE_GRACE_SECONDS: ${MEDIA_PUBLISHER_IDLE_GRACE_SECONDS:-180}
+      HAZARD_MEDIA_SESSION_TTL_SECONDS: ${HAZARD_MEDIA_SESSION_TTL_SECONDS:-4500}
+      HAZARD_MEDIA_SESSION_COOKIE_SECURE: ${HAZARD_MEDIA_SESSION_COOKIE_SECURE:-true}
+      HAZARD_MEDIA_SESSION_COOKIE_SAMESITE: ${HAZARD_MEDIA_SESSION_COOKIE_SAMESITE:-lax}
+      MEDIA_SESSION_COOKIE_NAME: ${MEDIA_SESSION_COOKIE_NAME:-__Secure-vn_media}
+      MEDIA_SESSION_TTL_SECONDS: ${MEDIA_SESSION_TTL_SECONDS:-600}
+      PYTHONPATH: /app
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres/${POSTGRES_DB:?POSTGRES_DB must be set}"
+    env_file:
+      - .env
+    # Mount the examples directory for application access
+    volumes:
+      - ./examples:/app/examples
+    # Ensure the backend starts only after Redis is healthy
+    depends_on:
+      base:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      media-server:
+        condition: service_started
+    # Command to run the backend using Uvicorn
+    command: ["uvicorn", "examples.streaming_web.app:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "10"]
+    # Expose the backend on port 8000
+    ports:
+      - '127.0.0.1:8000:8000'
+    # Attach the backend to the custom network
+    networks:
+      - app_network
+
+  local-notification-server:
+    # Build the image from the specified Dockerfile
+    build:
+      context: .
+      dockerfile: examples/local_notification_server/Dockerfile
+    # Environment variables for connecting to Redis
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres/${POSTGRES_DB:?POSTGRES_DB must be set}"
+    # Mount the examples directory for application access
+    volumes:
+      - ./examples:/app/examples
+    # The delivery worker reads both Redis and PostgreSQL.
+    depends_on:
+      base:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Command to run the local notification server using Uvicorn
+    command: ["uvicorn", "examples.local_notification_server.app:app", "--host", "0.0.0.0", "--port", "8003"]
+
+  violation-records:
+    # Build the image from the specified Dockerfile
+    build:
+      context: .
+      dockerfile: examples/violation_records/Dockerfile
+    # Environment variables for connecting to Redis and PostgreSQL
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres/${POSTGRES_DB:?POSTGRES_DB must be set}"
+    # Mount the examples directory for application access
+    volumes:
+      - ./examples:/app/examples
+    # Ensure the service starts only after Redis and PostgreSQL are healthy
+    depends_on:
+      base:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Command to run the violation records service using Uvicorn
+    command: ["uvicorn", "examples.violation_records.app:app", "--host", "0.0.0.0", "--port", "8002"]
+
+  # Construction hazard detection service configuration
+  construction-hazard-detection:
+    # Build the image from the specified Dockerfile
+    build:
+      context: .
+      dockerfile: Dockerfile
+    shm_size: ${YOLO_WORKER_SHM_SIZE:-1g}
+    # Environment variables for connecting to Redis
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
+      DETECT_API_URL: ${DETECT_API_URL:-http://yolo-server-api:6000}
+      STREAMING_OUTPUT_MODE: ${STREAMING_OUTPUT_MODE:-media_server}
+      MEDIA_PUBLISH_RTSP_BASE_URL: ${MEDIA_PUBLISH_RTSP_BASE_URL:-rtsp://media-server:8554}
+      MEDIA_PUBLISH_CLEAN_STREAM: ${MEDIA_PUBLISH_CLEAN_STREAM:-true}
+      MEDIA_PUBLISH_CLEAN_SOURCE_RESTREAM: ${MEDIA_PUBLISH_CLEAN_SOURCE_RESTREAM:-false}
+      MEDIA_PUBLISH_CLEAN_ENCODER: ${MEDIA_PUBLISH_CLEAN_ENCODER:-h264_vaapi}
+      MEDIA_PUBLISH_CLEAN_FPS: ${MEDIA_PUBLISH_CLEAN_FPS:-15}
+      MEDIA_PUBLISH_ANNOTATED_STREAM: ${MEDIA_PUBLISH_ANNOTATED_STREAM:-true}
+      MEDIA_PUBLISH_SOURCE_FPS: ${MEDIA_PUBLISH_SOURCE_FPS:-15}
+      MEDIA_PUBLISH_RTP_PACKET_SIZE: ${MEDIA_PUBLISH_RTP_PACKET_SIZE:-1200}
+      MEDIA_DEFAULT_OVERLAY_LANGUAGE: ${MEDIA_DEFAULT_OVERLAY_LANGUAGE:-zh-TW}
+      MEDIA_OVERLAY_ALLOWED_LANGUAGES: ${MEDIA_OVERLAY_ALLOWED_LANGUAGES:-zh-TW,en,zh-CN,ja,vi,id,fr,th}
+      MEDIA_OVERLAY_MAX_ACTIVE_LANGUAGES_PER_STREAM: ${MEDIA_OVERLAY_MAX_ACTIVE_LANGUAGES_PER_STREAM:-5}
+      MEDIA_DEMAND_CACHE_SECONDS: ${MEDIA_DEMAND_CACHE_SECONDS:-0.5}
+      MEDIA_OVERLAY_READY_TTL_SECONDS: ${MEDIA_OVERLAY_READY_TTL_SECONDS:-15}
+      MEDIA_PUBLISH_OVERLAY_MIN_CONFIDENCE: ${MEDIA_PUBLISH_OVERLAY_MIN_CONFIDENCE:-0.25}
+      MEDIA_PUBLISH_STARTUP_SLATE: ${MEDIA_PUBLISH_STARTUP_SLATE:-true}
+      MEDIA_PUBLISH_STARTUP_WIDTH: ${MEDIA_PUBLISH_STARTUP_WIDTH:-1280}
+      MEDIA_PUBLISH_STARTUP_HEIGHT: ${MEDIA_PUBLISH_STARTUP_HEIGHT:-720}
+      MEDIA_PUBLISH_ENCODER: ${MEDIA_PUBLISH_ENCODER:-h264_vaapi}
+      MEDIA_PUBLISH_VAAPI_DEVICE: ${MEDIA_PUBLISH_VAAPI_DEVICE:-/dev/dri/renderD128}
+      MEDIA_PUBLISH_VAAPI_RC_MODE: ${MEDIA_PUBLISH_VAAPI_RC_MODE:-CBR}
+      MEDIA_PUBLISH_VAAPI_BITRATE: ${MEDIA_PUBLISH_VAAPI_BITRATE:-4M}
+      MEDIA_PUBLISH_VAAPI_MAXRATE: ${MEDIA_PUBLISH_VAAPI_MAXRATE:-8M}
+      MEDIA_PUBLISH_VAAPI_BUFSIZE: ${MEDIA_PUBLISH_VAAPI_BUFSIZE:-16M}
+      MEDIA_PUBLISH_VAAPI_ASYNC_DEPTH: ${MEDIA_PUBLISH_VAAPI_ASYNC_DEPTH:-1}
+      MEDIA_PUBLISH_NVENC_PRESET: ${MEDIA_PUBLISH_NVENC_PRESET:-p1}
+      MEDIA_PUBLISH_NVENC_CQ: ${MEDIA_PUBLISH_NVENC_CQ:-30}
+      MEDIA_PUBLISH_NVENC_MAXRATE: ${MEDIA_PUBLISH_NVENC_MAXRATE:-8M}
+      MEDIA_PUBLISH_NVENC_BUFSIZE: ${MEDIA_PUBLISH_NVENC_BUFSIZE:-16M}
+      MEDIA_PUBLISH_FPS: ${MEDIA_PUBLISH_FPS:-15}
+      MEDIA_PUBLISH_CRF: ${MEDIA_PUBLISH_CRF:-28}
+      MEDIA_PUBLISH_PRESET: ${MEDIA_PUBLISH_PRESET:-veryfast}
+      YOLO_WORKER_RESULT_QUEUE_SIZE: ${YOLO_WORKER_RESULT_QUEUE_SIZE:-8}
+      YOLO_WORKER_RING_SLOTS: ${YOLO_WORKER_RING_SLOTS:-2}
+      YOLO_WORKER_RING_SLOT_CLEANUP_SECONDS: ${YOLO_WORKER_RING_SLOT_CLEANUP_SECONDS:-120}
+      MEDIA_PREVIEW_WIDTH: ${MEDIA_PREVIEW_WIDTH:-640}
+      MEDIA_PREVIEW_HEIGHT: ${MEDIA_PREVIEW_HEIGHT:-360}
+      MEDIA_PREVIEW_FPS: ${MEDIA_PREVIEW_FPS:-15}
+      MEDIA_PREVIEW_BITRATE: ${MEDIA_PREVIEW_BITRATE:-500k}
+      MEDIA_PREVIEW_MAXRATE: ${MEDIA_PREVIEW_MAXRATE:-700k}
+      MEDIA_PREVIEW_BUFSIZE: ${MEDIA_PREVIEW_BUFSIZE:-1400k}
+    env_file:
+      - .env
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - ${INTEL_RENDER_GID:-992}
+    # Mount the configuration directory for application access
+    volumes:
+      - ./config:/app/config
+      - ./models/pt:/app/models/pt
+      - ./.env:/app/.env
+    # Ensure the service starts only after Redis is healthy
+    depends_on:
+      base:
+        condition: service_started
+      base-gpu:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      media-server:
+        condition: service_started
+      yolo-server-api:
+        condition: service_started
+    # Command to run the application with the specified configuration
+    # command: ["--config", "/app/config/configuration.yaml"]
+    # Command to run the main application
+    command: ["python", "main.py"]
+    # Expose the service on port 8002
+    ports:
+      - '127.0.0.1:8002:8002'
+    # Attach the service to the custom network
+    networks:
+      - app_network
